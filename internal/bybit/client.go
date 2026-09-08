@@ -32,7 +32,15 @@ func New(apiKey, apiSecret string, testnet bool) *Client {
 		apiKey: apiKey,
 		secret: apiSecret,
 		base:   base,
-		hc:     &http.Client{Timeout: 25 * time.Second},
+		hc: &http.Client{
+			Timeout: 25 * time.Second,
+			Transport: &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
+				MaxIdleConns:        10,
+				IdleConnTimeout:     60 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
+			},
+		},
 	}
 }
 

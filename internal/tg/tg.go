@@ -20,7 +20,15 @@ func New(token, chatID string) *Bot {
 	return &Bot{
 		token:  token,
 		chatID: chatID,
-		hc:     &http.Client{Timeout: 20 * time.Second},
+		hc: &http.Client{
+			Timeout: 20 * time.Second,
+			Transport: &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
+				MaxIdleConns:        10,
+				IdleConnTimeout:     60 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
+			},
+		},
 	}
 }
 

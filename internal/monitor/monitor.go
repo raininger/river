@@ -78,9 +78,10 @@ func (m *Monitor) RunOnce(ctx context.Context) error {
 				log.Printf("%s 日线不足(得到 %d 根), 跳过", p.Symbol, len(candles))
 				continue
 			}
-			prevClose := floatOf(candles[len(candles)-2].Close)
-			yestClose := floatOf(candles[len(candles)-1].Close)
-			if prevClose <= 0 {
+			yestClose, okY := closeAt(candles, utcMidnight(yesterday).UnixMilli())
+			prevClose, okP := closeAt(candles, from.UnixMilli())
+			if !okY || !okP || prevClose <= 0 {
+				log.Printf("%s 缺少昨日/前日日线, 跳过", p.Symbol)
 				continue
 			}
 			delta := (yestClose - prevClose) / prevClose * 100
@@ -153,6 +154,16 @@ func buildReport(dateStr string, totalPos int, sumPnlAll float64, hits []hit, su
 
 func utcMidnight(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+func closeAt(candles []bybit.Candle, openMillis int64) (float64, bool) {
+	want := strconv.FormatInt(openMillis, 10)
+	for _, c := range candles {
+		if c.OpenTime == want {
+			return floatOf(c.Close), c.Close != ""
+		}
+	}
+	return 0, false
 }
 
 func sideLabel(side string) string {
