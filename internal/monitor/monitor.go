@@ -50,10 +50,17 @@ func (m *Monitor) RunOnce(ctx context.Context) error {
 	totalPos := 0
 	sumPnlAll := 0.0
 
-	for _, cat := range []string{"linear", "inverse"} {
-		positions, err := m.bc.Positions(ctx, cat)
+	for _, sc := range []struct {
+		cat   string
+		settle string
+	}{
+		{cat: "linear", settle: "USDT"},
+		{cat: "linear", settle: "USDC"},
+		{cat: "inverse"},
+	} {
+		positions, err := m.bc.Positions(ctx, sc.cat, sc.settle)
 		if err != nil {
-			return fmt.Errorf("获取 %s 持仓失败: %w", cat, err)
+			return fmt.Errorf("获取 %s(%s) 持仓失败: %w", sc.cat, sc.settle, err)
 		}
 		for _, p := range positions {
 			if sizeF(p.Size) == 0 {
@@ -62,7 +69,7 @@ func (m *Monitor) RunOnce(ctx context.Context) error {
 			totalPos++
 			sumPnlAll += floatOf(p.UnrealisedPnl)
 
-			candles, err := m.bc.DailyCandles(ctx, cat, p.Symbol, from, to)
+			candles, err := m.bc.DailyCandles(ctx, sc.cat, p.Symbol, from, to)
 			if err != nil {
 				log.Printf("获取 %s 日线失败: %v", p.Symbol, err)
 				continue
@@ -78,7 +85,7 @@ func (m *Monitor) RunOnce(ctx context.Context) error {
 			}
 			delta := (yestClose - prevClose) / prevClose * 100
 			log.Printf("持仓 %s(%s) size=%s 前日收盘=%.4f 昨日收盘=%.4f 昨日涨跌=%+.2f%%",
-				p.Symbol, cat, p.Size, prevClose, yestClose, delta)
+				p.Symbol, sc.cat, p.Size, prevClose, yestClose, delta)
 			if math.Abs(delta) > moveThreshold {
 				allHits = append(allHits, hit{pos: p, prevClose: prevClose, yestClose: yestClose, deltaPct: delta})
 			}
@@ -130,6 +137,7 @@ func buildReport(dateStr string, totalPos int, sumPnlAll float64, hits []hit, su
 		fmt.Fprintf(&b, "   持仓量: %s | 杠杆: %sx\n", numTrim(size), numTrim(floatOf(p.Leverage)))
 		fmt.Fprintf(&b, "   开仓均价: %s\n", moneyTrim(avg))
 		fmt.Fprintf(&b, "   昨日收盘: %s\n", moneyTrim(h.yestClose))
+		fmt.Fprintf(&b, "   当前标记价: %s\n", moneyTrim(floatOf(p.MarkPrice)))
 		fmt.Fprintf(&b, "   昨日涨跌: %s (%s)\n", pctStr(h.deltaPct), upDownLabel(h.deltaPct))
 		fmt.Fprintf(&b, "   未实现盈亏: %s %s\n", signedMoney(pnl), unit)
 		if r, ok := marginReturn(p, pnl); ok {

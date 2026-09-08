@@ -9,6 +9,7 @@ type Position struct {
 	UnrealisedPnl string `json:"unrealisedPnl"`
 	Leverage      string `json:"leverage"`
 	PositionIM    string `json:"positionIM"`
+	MarkPrice     string `json:"markPrice"`
 	UpdatedTime   string `json:"updatedTime"`
 }
 

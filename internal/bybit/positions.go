@@ -5,13 +5,16 @@ import (
 	"net/url"
 )
 
-func (c *Client) Positions(ctx context.Context, category string) ([]Position, error) {
+func (c *Client) Positions(ctx context.Context, category, settleCoin string) ([]Position, error) {
 	var all []Position
 	cursor := ""
 	for page := 0; page < 200; page++ {
 		q := url.Values{}
 		q.Set("category", category)
 		q.Set("limit", "200")
+		if settleCoin != "" {
+			q.Set("settleCoin", settleCoin)
+		}
 		if cursor != "" {
 			q.Set("cursor", cursor)
 		}
