@@ -19,8 +19,10 @@ import (
 func main() {
 	var runOnce bool
 	var dailyTime string
+	var envFile string
 	flag.BoolVar(&runOnce, "once", false, "立即运行一次并退出(适合配合 cron)")
 	flag.StringVar(&dailyTime, "daily-time", "00:01", "每日定时运行的 UTC 时间 (HH:MM), 守护进程模式使用")
+	flag.StringVar(&envFile, "env", ".env", "配置文件路径, 默认读取当前目录下的 .env")
 	flag.Parse()
 
 	hh, mm, err := parseClock(dailyTime)
@@ -28,7 +30,7 @@ func main() {
 		log.Fatalf("无效的 -daily-time: %v", err)
 	}
 
-	c, err := cfg.Load()
+	c, err := cfg.Load(envFile)
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}

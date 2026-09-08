@@ -15,8 +15,8 @@ type Config struct {
 	ChatID    string
 }
 
-func Load() (Config, error) {
-	loadDotEnv(".env")
+func Load(envFile string) (Config, error) {
+	loadDotEnv(envFile)
 	c := Config{
 		APIKey:    os.Getenv("BYBIT_API_KEY"),
 		APISecret: os.Getenv("BYBIT_API_SECRET"),
