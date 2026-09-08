@@ -2,6 +2,7 @@ package bybit
 
 import (
 	"context"
+	"encoding/json"
 	"net/url"
 	"strconv"
 	"time"
@@ -17,11 +18,20 @@ func (c *Client) DailyCandles(ctx context.Context, category, symbol string, star
 	q.Set("limit", "10")
 
 	var res struct {
-		List     []Candle `json:"list"`
-		Category string   `json:"category"`
+		List     []json.RawMessage `json:"list"`
+		Category string            `json:"category"`
 	}
 	if err := c.call(ctx, "/v5/market/kline", q, &res); err != nil {
 		return nil, err
 	}
-	return res.List, nil
+
+	candles := make([]Candle, 0, len(res.List))
+	for _, raw := range res.List {
+		var cdl Candle
+		if err := json.Unmarshal(raw, &cdl); err != nil {
+			continue
+		}
+		candles = append(candles, cdl)
+	}
+	return candles, nil
 }
