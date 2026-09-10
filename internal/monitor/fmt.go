@@ -11,25 +11,8 @@ func fmtGrouped(v float64, dec int) string {
 	return sign(neg) + groupInt(s)
 }
 
-func fmtGroupedTrim(v float64) string {
-	neg := v < 0
-	s := strconv.FormatFloat(abs(v), 'f', -1, 64)
-	return sign(neg) + groupInt(s)
-}
-
-func moneyTrim(v float64) string {
-	if v >= 1000 {
-		return fmtGrouped(v, 0)
-	}
-	return strconv.FormatFloat(v, 'f', -1, 64)
-}
-
 func signedMoney(v float64) string {
 	return fmtGrouped(v, 2)
-}
-
-func numTrim(v float64) string {
-	return fmtGroupedTrim(v)
 }
 
 func groupInt(s string) string {

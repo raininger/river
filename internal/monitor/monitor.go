@@ -51,7 +51,7 @@ func (m *Monitor) RunOnce(ctx context.Context) error {
 	sumPnlAll := 0.0
 
 	for _, sc := range []struct {
-		cat   string
+		cat    string
 		settle string
 	}{
 		{cat: "linear", settle: "USDT"},
@@ -122,34 +122,32 @@ func buildReport(dateStr string, totalPos int, sumPnlAll float64, hits []hit, su
 		return b.String()
 	}
 
-	b.WriteString("———— 异动品种概览 ————\n")
-	for i, h := range hits {
-		fmt.Fprintf(&b, "%2d) %-12s %s  %s\n", i+1, h.pos.Symbol, sideLabel(h.pos.Side), pctStr(h.deltaPct))
-	}
-
-	b.WriteString("\n———— 持仓明细 ————\n")
-	for i, h := range hits {
-		p := h.pos
-		avg := floatOf(p.AvgPrice)
-		size := sizeF(p.Size)
-		pnl := floatOf(p.UnrealisedPnl)
-		unit := settleUnit(p.Symbol)
-		fmt.Fprintf(&b, "\n%d) %s [%s]\n", i+1, p.Symbol, sideLabel(p.Side))
-		fmt.Fprintf(&b, "   持仓量: %s | 杠杆: %sx\n", numTrim(size), numTrim(floatOf(p.Leverage)))
-		fmt.Fprintf(&b, "   开仓均价: %s\n", moneyTrim(avg))
-		fmt.Fprintf(&b, "   昨日收盘: %s\n", moneyTrim(h.yestClose))
-		fmt.Fprintf(&b, "   当前标记价: %s\n", moneyTrim(floatOf(p.MarkPrice)))
-		fmt.Fprintf(&b, "   昨日涨跌: %s (%s)\n", pctStr(h.deltaPct), upDownLabel(h.deltaPct))
-		fmt.Fprintf(&b, "   未实现盈亏: %s %s\n", signedMoney(pnl), unit)
-		if r, ok := marginReturn(p, pnl); ok {
-			fmt.Fprintf(&b, "   持仓收益率(基于保证金): %s%%\n", numTrim(r))
+	var ups, downs []hit
+	for _, h := range hits {
+		if h.deltaPct > 0 {
+			ups = append(ups, h)
+		} else {
+			downs = append(downs, h)
 		}
 	}
+	writeGroup(&b, "上涨", ups)
+	writeGroup(&b, "下跌", downs)
 
-	fmt.Fprintf(&b, "\n———— 汇总 ————\n")
+	fmt.Fprintf(&b, "———— 汇总 ————\n")
 	fmt.Fprintf(&b, "异动持仓合计未实现盈亏: %s USDT\n", signedMoney(sumPnlHits))
 	fmt.Fprintf(&b, "全账户持仓未实现盈亏: %s USDT\n", signedMoney(sumPnlAll))
 	return b.String()
+}
+
+func writeGroup(b *strings.Builder, title string, hs []hit) {
+	if len(hs) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "———— %s (%d) ————\n", title, len(hs))
+	for i, h := range hs {
+		fmt.Fprintf(b, "%2d) %-12s %s  %s\n", i+1, h.pos.Symbol, sideLabel(h.pos.Side), pctStr(h.deltaPct))
+	}
+	b.WriteString("\n")
 }
 
 func utcMidnight(t time.Time) time.Time {
@@ -173,42 +171,8 @@ func sideLabel(side string) string {
 	return "做空"
 }
 
-func upDownLabel(delta float64) string {
-	if delta > 0 {
-		return "上涨"
-	}
-	return "下跌"
-}
-
 func pctStr(d float64) string {
 	return fmt.Sprintf("%+.2f%%", d)
-}
-
-func marginReturn(p bybit.Position, pnl float64) (float64, bool) {
-	margin := floatOf(p.PositionIM)
-	if margin <= 0 {
-		posVal := floatOf(p.PositionValue)
-		lev := floatOf(p.Leverage)
-		if lev > 0 && posVal > 0 {
-			margin = posVal / lev
-		}
-	}
-	if margin <= 0 {
-		return 0, false
-	}
-	return pnl / margin * 100, true
-}
-
-func settleUnit(symbol string) string {
-	for _, q := range []string{"USDT", "USDC"} {
-		if strings.HasSuffix(symbol, q) {
-			return q
-		}
-	}
-	if strings.HasSuffix(symbol, "USD") {
-		return strings.TrimSuffix(symbol, "USD")
-	}
-	return ""
 }
 
 func floatOf(s string) float64 {
