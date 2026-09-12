@@ -33,6 +33,9 @@ const (
 	backfillInterval = "1"
 	// backfillStep 与 backfillInterval 对应的时间跨度。
 	backfillStep = time.Minute
+	// backfillMultiple 是回补跨度相对 DropWindow 的倍数, 见 backfillSpan。
+	// 3 倍意味着 4h 窗口下能重放约 8h 的历史, 仍远在接口 1000 根上限之内。
+	backfillMultiple = 3
 
 	// volInterval 估计波动率使用的 K 线周期。用小时线而不是日线, 是因为日线一天
 	// 才更新一次, 暴跌当天完全感知不到——而那正是最需要反弹阈值变宽的时候。
@@ -164,7 +167,8 @@ func (s *Sentinel) state(key string) *symbolState {
 //  1. 用 1 小时 K 线算出各空单品种的波动率与回撤分位数, 决定反弹阈值 B 与
 //     武装阈值 A;
 //  2. 用 1 分钟 K 线回补价格窗口, 并重放状态机, 使进程在暴跌中途重启时
-//     已经跟踪到的最低点不会丢失。
+//     已经跟踪到的最低点不会丢失。回补跨度取窗口的若干倍, 因为窗口自己要先
+//     积累满 DropWindow 才开始判定, 见 backfillSpan。
 //
 // 连持仓都拉不到时返回 error; 单个品种失败只计数, 不中断整体回补。
 func (s *Sentinel) Warmup(ctx context.Context) (WarmupResult, error) {
@@ -176,7 +180,7 @@ func (s *Sentinel) Warmup(ctx context.Context) (WarmupResult, error) {
 		return res, err
 	}
 
-	from := now.Add(-s.cfg.DropWindow - 2*backfillStep)
+	from := now.Add(-s.backfillSpan() - 2*backfillStep)
 	limit := s.backfillLimit()
 
 	for i, h := range held {
@@ -227,9 +231,23 @@ func (s *Sentinel) Warmup(ctx context.Context) (WarmupResult, error) {
 	return res, nil
 }
 
+// backfillSpan 是启动回补覆盖的时间跨度, 取窗口长度的若干倍。
+//
+// 必须明显长于 DropWindow, 因为回放时窗口自己要先积累满 DropWindow 才能给出
+// 第一个判定——真正能重放的历史只有「回补跨度 − DropWindow」这一段。只回补
+// 一个窗口的话, 这段就只剩几分钟, 重启恰好落在暴跌中途时 low 会从一个偏高的
+// 位置起算, replay 就白做了。
+func (s *Sentinel) backfillSpan() time.Duration {
+	span := s.cfg.DropWindow * backfillMultiple
+	if max := bybit.MaxKlineLimit * time.Minute; span > max {
+		span = max
+	}
+	return span
+}
+
 // backfillLimit 计算回补所需的 K 线根数, 并夹在接口允许的范围内。
 func (s *Sentinel) backfillLimit() int {
-	n := int(s.cfg.DropWindow/backfillStep) + 5
+	n := int(s.backfillSpan()/backfillStep) + 5
 	if n > bybit.MaxKlineLimit {
 		n = bybit.MaxKlineLimit
 	}
