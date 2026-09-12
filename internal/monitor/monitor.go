@@ -69,7 +69,7 @@ func (m *Monitor) RunOnce(ctx context.Context) error {
 			totalPos++
 			sumPnlAll += floatOf(p.UnrealisedPnl)
 
-			candles, err := m.bc.DailyCandles(ctx, sc.cat, p.Symbol, from, to)
+			candles, err := m.bc.Candles(ctx, sc.cat, p.Symbol, "D", from, to, 10)
 			if err != nil {
 				log.Printf("获取 %s 日线失败: %v", p.Symbol, err)
 				continue
@@ -169,10 +169,6 @@ func sideLabel(side string) string {
 		return "做多"
 	}
 	return "做空"
-}
-
-func pctStr(d float64) string {
-	return fmt.Sprintf("%+.2f%%", d)
 }
 
 func floatOf(s string) float64 {

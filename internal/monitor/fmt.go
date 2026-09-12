@@ -1,48 +1,10 @@
 package monitor
 
-import (
-	"strconv"
-	"strings"
-)
+import "bybit-position-monitor/internal/numfmt"
 
-func fmtGrouped(v float64, dec int) string {
-	neg := v < 0
-	s := strconv.FormatFloat(abs(v), 'f', dec, 64)
-	return sign(neg) + groupInt(s)
-}
+// 通用的数字/金额格式化已抽到 internal/numfmt, 哨兵共用同一套实现。
+// 这里保留包内的短名字, 避免改动调用处。
 
-func signedMoney(v float64) string {
-	return fmtGrouped(v, 2)
-}
+func signedMoney(v float64) string { return numfmt.SignedMoney(v) }
 
-func groupInt(s string) string {
-	if i := strings.IndexByte(s, '.'); i >= 0 {
-		return groupInt(s[:i]) + s[i:]
-	}
-	if len(s) <= 3 {
-		return s
-	}
-	var b strings.Builder
-	n := len(s)
-	for i := 0; i < n; i++ {
-		if i > 0 && (n-i)%3 == 0 {
-			b.WriteByte(',')
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
-}
-
-func sign(neg bool) string {
-	if neg {
-		return "-"
-	}
-	return ""
-}
-
-func abs(v float64) float64 {
-	if v < 0 {
-		return -v
-	}
-	return v
-}
+func pctStr(d float64) string { return numfmt.Pct(d) }

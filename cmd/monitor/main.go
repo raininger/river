@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"bybit-position-monitor/internal/cfg"
+	"bybit-position-monitor/internal/daemon"
 	"bybit-position-monitor/internal/monitor"
 )
 
@@ -21,17 +21,17 @@ func main() {
 	var runOnce bool
 	var dailyTime string
 	var envFile string
-	var daemon bool
+	var daemonize bool
 	var logFile string
 	flag.BoolVar(&runOnce, "once", false, "立即运行一次并退出(适合配合 cron)")
 	flag.StringVar(&dailyTime, "daily-time", "00:01", "每日定时运行的 UTC 时间 (HH:MM), 守护进程模式使用")
 	flag.StringVar(&envFile, "env", ".env", "配置文件路径, 默认读取当前目录下的 .env")
-	flag.BoolVar(&daemon, "daemon", false, "以守护进程模式运行(脱离终端后台常驻)")
+	flag.BoolVar(&daemonize, "daemon", false, "以守护进程模式运行(脱离终端后台常驻)")
 	flag.StringVar(&logFile, "log", "monitor.log", "-daemon 模式下写日志的文件")
 	flag.Parse()
 
-	if daemon && os.Getenv("RIVER_DAEMON_CHILD") != "1" {
-		pid, err := spawnDaemon(logFile)
+	if daemonize && !daemon.IsChild() {
+		pid, err := daemon.Spawn(logFile)
 		if err != nil {
 			log.Fatalf("后台启动失败: %v", err)
 		}
@@ -82,32 +82,6 @@ func main() {
 			}
 		}
 	}
-}
-
-func spawnDaemon(logFile string) (int, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return 0, err
-	}
-	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return 0, err
-	}
-	cmd := exec.Command(exe, os.Args[1:]...)
-	cmd.Env = append(os.Environ(), "RIVER_DAEMON_CHILD=1")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	cmd.Stdin = nil
-	cmd.Stdout = f
-	cmd.Stderr = f
-	if err := cmd.Start(); err != nil {
-		f.Close()
-		return 0, err
-	}
-	go func() {
-		cmd.Wait()
-		f.Close()
-	}()
-	return cmd.Process.Pid, nil
 }
 
 func parseClock(s string) (int, int, error) {

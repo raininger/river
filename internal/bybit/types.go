@@ -11,6 +11,9 @@ type Position struct {
 	PositionIM    string `json:"positionIM"`
 	MarkPrice     string `json:"markPrice"`
 	UpdatedTime   string `json:"updatedTime"`
+	// PositionIdx 单向持仓模式为 0, 双向持仓模式下多头为 1、空头为 2。
+	// 下单时直接透传此值, 即可同时适配两种持仓模式。
+	PositionIdx int `json:"positionIdx"`
 }
 
 type Candle struct {
