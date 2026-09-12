@@ -18,6 +18,7 @@ func validSentinel() Sentinel {
 		PollInterval:       15 * time.Second,
 		DropWindow:         time.Hour,
 		DropPct:            3.0,
+		ArmQuantile:        0.995,
 		MinProfitPct:       0,
 		MaxOrdersPerCycle:  10,
 		OrderMinGap:        150 * time.Millisecond,
@@ -103,6 +104,8 @@ func TestValidateRejectsBadThresholds(t *testing.T) {
 		"覆盖阈值为 0":            func(s *Sentinel) { s.Overrides = map[string]float64{"X": 0} },
 		"缺少凭据":               func(s *Sentinel) { s.APIKey = "" },
 		"DROP_WINDOW 超过接口上限": func(s *Sentinel) { s.DropWindow = 1001 * time.Minute },
+		"ARM_QUANTILE 为 1":   func(s *Sentinel) { s.ArmQuantile = 1 },
+		"ARM_QUANTILE 为负":    func(s *Sentinel) { s.ArmQuantile = -0.1 },
 		"VOL_MULT 为 0":       func(s *Sentinel) { s.VolMult = 0 },
 		"VOL_LOOKBACK 太短":    func(s *Sentinel) { s.VolLookback = time.Hour },
 		"VOL_LOOKBACK 超过上限":  func(s *Sentinel) { s.VolLookback = 1001 * time.Hour },
@@ -120,20 +123,41 @@ func TestValidateRejectsBadThresholds(t *testing.T) {
 	}
 }
 
-// 逐品种覆盖优先于全局阈值, 且 symbol 大小写不敏感。
-func TestDropPctFor(t *testing.T) {
+// A 的优先级: 逐品种覆盖 > 回撤分位数(下限) > 全局固定值。
+func TestArmPctForPrecedence(t *testing.T) {
 	s := validSentinel()
 	s.DropPct = 3.0
+	s.ArmQuantile = 0.995
 	s.Overrides = map[string]float64{"ETHUSDT": 2.0}
 
-	if got := s.DropPctFor("ETHUSDT"); got != 2.0 {
+	// 逐品种覆盖最优先, 与分位数无关
+	if got := s.ArmPctFor("ETHUSDT", 12.0); got != 2.0 {
 		t.Fatalf("ETHUSDT 应取覆盖值 2.0, 实际 %v", got)
 	}
-	if got := s.DropPctFor("ethusdt"); got != 2.0 {
+	// symbol 比较应不区分大小写
+	if got := s.ArmPctFor("ethusdt", 12.0); got != 2.0 {
 		t.Fatalf("symbol 比较应不区分大小写, 实际 %v", got)
 	}
-	if got := s.DropPctFor("BTCUSDT"); got != 3.0 {
-		t.Fatalf("无覆盖的品种应取全局值 3.0, 实际 %v", got)
+	// 无覆盖: 直接用该品种自己的分位数, 而不是全局固定值——这正是自适应的意义
+	if got := s.ArmPctFor("BTCUSDT", 2.4); got != 2.4 {
+		t.Fatalf("应取分位数 2.4, 实际 %v", got)
+	}
+	// 极低波动品种的分位数可能小到没有意义, 应被下限抬到 1.0
+	if got := s.ArmPctFor("BTCUSDT", 0.05); got != 1.0 {
+		t.Fatalf("应被下限抬到 1.0, 实际 %v", got)
+	}
+	// 样本不足(K 线不够, 新上市品种) → 退回固定值
+	if got := s.ArmPctFor("BTCUSDT", 0); got != 3.0 {
+		t.Fatalf("样本不足时应取固定值 3.0, 实际 %v", got)
+	}
+	// 关掉自适应 → 一律用固定值, 分位数被忽略
+	s.ArmQuantile = 0
+	if got := s.ArmPctFor("BTCUSDT", 2.4); got != 3.0 {
+		t.Fatalf("关闭自适应后应取固定值 3.0, 实际 %v", got)
+	}
+	// 但压不过逐品种覆盖
+	if got := s.ArmPctFor("ETHUSDT", 2.4); got != 2.0 {
+		t.Fatalf("逐品种覆盖应仍优先, 实际 %v", got)
 	}
 }
 

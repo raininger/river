@@ -21,9 +21,19 @@ type Sentinel struct {
 	// PollInterval 轮询持仓的间隔。
 	PollInterval time.Duration
 	// DropWindow 是衡量回撤的回看窗口。
+	//
+	// 它同时决定了 A 与 B 的相对大小, 这一条比它看起来重要: 两者都是百分比,
+	// 但 B 只随 σ 走, A 还随窗口变长而变大(随机游走下回撤幅度约按 √窗口 增长)。
+	// 实测(30 天小时线): 1h 窗口下 A ≈ 1.2B, 4h 窗口下 A ≈ 2.6B。A 太接近 B
+	// 意味着「跌 A% 再弹 B%」这两件事本身差不多大, 等于在噪声里平仓, 所以取 4h。
 	DropWindow time.Duration
-	// DropPct 是武装阈值 A(%): 现价相对 DropWindow 内最高价回撤多少算一场暴跌。
+	// DropPct 是武装阈值 A(%) 的固定值: 现价相对 DropWindow 内最高价回撤多少算
+	// 一场暴跌。ArmQuantile 打开时它是「样本不足」与「逐品种覆盖」之外的兜底值。
 	DropPct float64
+	// ArmQuantile 是武装阈值 A 的自适应分位数: A 取「窗口内回撤」在该品种历史
+	// 分布中的这个分位, 即「这个品种自己最猛的那 0.5% 的下跌」。0 表示关闭自适应,
+	// 一律用 DropPct。
+	ArmQuantile float64
 	// MinProfitPct 是浮盈门槛(%), 0 表示只要浮盈为正即可。
 	MinProfitPct float64
 	// MaxOrdersPerCycle 单轮最多下多少个平仓单, 超出的留到下一轮。
@@ -52,12 +62,28 @@ type Sentinel struct {
 	VolFloorPct float64
 }
 
-// DropPctFor 返回某个品种适用的武装阈值 A: 优先取逐品种覆盖, 否则用全局默认值。
-func (s Sentinel) DropPctFor(symbol string) float64 {
+// armFloorPct 是自适应武装阈值 A 的下限。极低波动品种(稳定币、做市标的)的回撤
+// 分位数可能小到没有意义, 加个底避免在尘埃级的波动上武装。
+const armFloorPct = 1.0
+
+// ArmPctFor 返回某个品种适用的武装阈值 A(%)。优先级:
+//
+//	逐品种覆盖 > 回撤分位数(下限 armFloorPct) > 全局固定值 DropPct
+//
+// quantile 是该品种「窗口内回撤」的历史分位数(%); 关闭自适应或样本不足时为 0,
+// 两种情况都退回固定值。100+ 个品种的波动率能差一个数量级, 所以默认走自适应:
+// 同一个百分比在 BTC 上是暴跌, 在次新 meme 上只是日常波动。
+func (s Sentinel) ArmPctFor(symbol string, quantile float64) float64 {
 	if v, ok := s.Overrides[strings.ToUpper(symbol)]; ok {
 		return v
 	}
-	return s.DropPct
+	if s.ArmQuantile <= 0 || quantile <= 0 {
+		return s.DropPct
+	}
+	if quantile < armFloorPct {
+		return armFloorPct
+	}
+	return quantile
 }
 
 // ReboundFor 返回某个品种适用的反弹阈值 B(%)。优先级:
@@ -99,10 +125,13 @@ func LoadSentinel(envFile string) (Sentinel, error) {
 	if s.PollInterval, err = durEnv("POLL_INTERVAL", 15*time.Second); err != nil {
 		return s, err
 	}
-	if s.DropWindow, err = durEnv("DROP_WINDOW", time.Hour); err != nil {
+	if s.DropWindow, err = durEnv("DROP_WINDOW", 4*time.Hour); err != nil {
 		return s, err
 	}
 	if s.DropPct, err = floatEnv("DROP_PCT", 3.0); err != nil {
+		return s, err
+	}
+	if s.ArmQuantile, err = floatEnv("ARM_QUANTILE", 0.995); err != nil {
 		return s, err
 	}
 	if s.MinProfitPct, err = floatEnv("MIN_PROFIT_PCT", 0); err != nil {
@@ -163,6 +192,11 @@ func (s Sentinel) Validate() error {
 	}
 	if s.DropPct <= 0 {
 		return fmt.Errorf("DROP_PCT 必须大于 0, 当前为 %g", s.DropPct)
+	}
+	if s.ArmQuantile < 0 || s.ArmQuantile >= 1 {
+		return fmt.Errorf(
+			"ARM_QUANTILE 必须落在 [0, 1) 之间(0 表示关闭自适应, 一律用 DROP_PCT), 当前为 %g",
+			s.ArmQuantile)
 	}
 	if s.MinProfitPct < 0 {
 		return fmt.Errorf("MIN_PROFIT_PCT 不能为负, 当前为 %g", s.MinProfitPct)

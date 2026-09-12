@@ -27,6 +27,7 @@ func main() {
 		interval  time.Duration
 		window    time.Duration
 		dropPct   float64
+		armQ      float64
 		volMult   float64
 		maxOrders int
 	)
@@ -40,7 +41,8 @@ func main() {
 
 	flag.DurationVar(&interval, "interval", 0, "轮询间隔, 覆盖 POLL_INTERVAL")
 	flag.DurationVar(&window, "window", 0, "回撤回看窗口, 覆盖 DROP_WINDOW")
-	flag.Float64Var(&dropPct, "drop-pct", 0, "武装阈值 A(%), 覆盖 DROP_PCT")
+	flag.Float64Var(&dropPct, "drop-pct", 0, "固定的武装阈值 A(%), 覆盖 DROP_PCT(自适应关闭或样本不足时的兜底值)")
+	flag.Float64Var(&armQ, "arm-quantile", 0, "A 的自适应分位数, 覆盖 ARM_QUANTILE(0 表示改为固定值)")
 	flag.Float64Var(&volMult, "vol-mult", 0, "B 的波动率倍数, 覆盖 VOL_MULT")
 	flag.IntVar(&maxOrders, "max-orders", 0, "单轮最多平仓数, 覆盖 MAX_ORDERS_PER_CYCLE")
 	flag.Parse()
@@ -69,6 +71,8 @@ func main() {
 			c.DropWindow = window
 		case "drop-pct":
 			c.DropPct = dropPct
+		case "arm-quantile":
+			c.ArmQuantile = armQ
 		case "vol-mult":
 			c.VolMult = volMult
 		case "max-orders":
@@ -91,9 +95,9 @@ func main() {
 		mode = "实盘(会真实市价平仓)"
 	}
 	log.Printf("回撤止盈哨兵 | 模式: %s | testnet=%v", mode, c.Testnet)
-	log.Printf("参数: 轮询 %s | 回撤窗口 %s | 默认 A=%.2f%% | B=%s | 浮盈门槛 %.2f%% | 单轮上限 %d | 下单间隔 %s",
-		c.PollInterval, c.DropWindow, c.DropPct, s.ReboundLabel(), c.MinProfitPct, c.MaxOrdersPerCycle, c.OrderMinGap)
-	log.Printf("逐品种覆盖: A %d 个, B %d 个 | 波动率: 1 小时 K 线回看 %s",
+	log.Printf("参数: 轮询 %s | 回撤窗口 %s | A=%s | B=%s | 浮盈门槛 %.2f%% | 单轮上限 %d | 下单间隔 %s",
+		c.PollInterval, c.DropWindow, s.ArmLabel(), s.ReboundLabel(), c.MinProfitPct, c.MaxOrdersPerCycle, c.OrderMinGap)
+	log.Printf("逐品种覆盖: A %d 个, B %d 个 | σ 回看 %s",
 		len(c.Overrides), len(c.ReboundOverrides), c.VolLookback)
 	if !c.DryRun {
 		log.Printf("!! 实盘模式已开启, 触发后会对空头仓位下市价平仓单 !!")
@@ -107,8 +111,8 @@ func main() {
 		log.Printf("回补失败: %v", err)
 		log.Printf("将以空窗口进入轮询, 各品种需要积累满 %s 的数据后才会开始判定", c.DropWindow)
 	} else {
-		log.Printf("回补完成: 价格窗口成功 %d 个、失败 %d 个; 波动率算出 %d 个、退回兜底值 %d 个",
-			res.WindowOK, res.WindowFailed, res.VolOK, res.VolFallback)
+		log.Printf("回补完成: 价格窗口成功 %d 个、失败 %d 个; B 算出 %d 个、退回兜底值 %d 个; A 算出 %d 个、退回固定值 %d 个",
+			res.WindowOK, res.WindowFailed, res.VolOK, res.VolFallback, res.ArmOK, res.ArmFallback)
 	}
 
 	sendStartupNotice(ctx, s, c, mode, res)
@@ -150,9 +154,10 @@ func main() {
 }
 
 func sendStartupNotice(ctx context.Context, s *sentinel.Sentinel, c cfg.Sentinel, mode string, res sentinel.WarmupResult) {
-	msg := fmt.Sprintf("🚀 回撤止盈哨兵已启动\n模式: %s\n回撤窗口 %s | 默认 A=%.2f%% | 浮盈门槛 %.2f%%\nB=%s\n轮询 %s | 单轮上限 %d\n回补: 价格窗口 %d 个, 波动率 %d 个(兜底 %d 个)",
-		mode, c.DropWindow, c.DropPct, c.MinProfitPct, s.ReboundLabel(),
-		c.PollInterval, c.MaxOrdersPerCycle, res.WindowOK, res.VolOK, res.VolFallback)
+	msg := fmt.Sprintf("🚀 回撤止盈哨兵已启动\n模式: %s\n回撤窗口 %s | 浮盈门槛 %.2f%%\nA=%s\nB=%s\n轮询 %s | 单轮上限 %d\n回补: 价格窗口 %d 个; B %d 个(兜底 %d 个); A %d 个(固定 %d 个)",
+		mode, c.DropWindow, c.MinProfitPct, s.ArmLabel(), s.ReboundLabel(),
+		c.PollInterval, c.MaxOrdersPerCycle,
+		res.WindowOK, res.VolOK, res.VolFallback, res.ArmOK, res.ArmFallback)
 	if !c.DryRun {
 		msg += "\n\n!! 实盘模式: 触发即真实市价平仓 !!"
 	}

@@ -39,8 +39,12 @@ const (
 	volInterval = "60"
 	// volStep 与 volInterval 对应的时间跨度。
 	volStep = time.Hour
-	// volMaxAge 波动率多久重算一次。小时线一小时才出一根, 更频繁没有意义。
+	// volMaxAge 这些统计量多久重算一次。小时线一小时才出一根, 更频繁没有意义。
 	volMaxAge = 90 * time.Minute
+	// armLookback 是回撤分位数(A)的回看时长。分位数取的是尾部, 需要足够长的历史
+	// 才能在尾部站住, 所以比 B 的 σ 回看长得多——B 要跟着行情动, A 要稳。
+	// 30 天 = 720 根小时线, 与接口上限 1000 根还留有窗口长度的余量。
+	armLookback = 30 * 24 * time.Hour
 	// volFetchPerCycle 单轮最多补算多少个品种的波动率, 把请求摊到多轮,
 	// 避免 100+ 个品种同时突发流量。
 	volFetchPerCycle = 10
@@ -81,16 +85,24 @@ type candidate struct {
 	profitPct float64 // 浮动盈亏占仓位的百分比
 }
 
-// volEntry 是缓存的波动率估计。vol 为 0 表示 K 线不足, 应退回兜底阈值。
-type volEntry struct {
-	vol float64
-	at  time.Time
+// stats 是从 1 小时 K 线算出的、决定 A 和 B 的两个数。两者共用同一批 K 线,
+// 所以只发一次请求。任一为 0 表示该类样本不足, 由 cfg 层退回兜底值。
+type stats struct {
+	vol float64 // 单根小时线的对数收益率标准差 → B(反弹阈值)
+	arm float64 // 窗口内回撤的历史分位数(%) → A(武装阈值)
+}
+
+type statsEntry struct {
+	stats
+	at time.Time
 }
 
 // WarmupResult 汇总启动期回补的结果, 供日志展示。
 type WarmupResult struct {
-	VolOK        int // 算出波动率的品种数
-	VolFallback  int // 退回兜底阈值的品种数(K 线不足或接口失败)
+	VolOK        int // 算出波动率的品种数(决定 B)
+	VolFallback  int // B 退回兜底值的品种数(K 线不足或接口失败)
+	ArmOK        int // 算出回撤分位数的品种数(决定 A)
+	ArmFallback  int // A 退回固定值的品种数(上市太新、K 线不足)
 	WindowOK     int // 价格窗口回补成功的品种数
 	WindowFailed int // 价格窗口回补失败的品种数
 }
@@ -104,7 +116,7 @@ type Sentinel struct {
 
 	windows map[string]*PriceWindow
 	states  map[string]*symbolState
-	vols    map[string]volEntry
+	stats   map[string]statsEntry
 
 	lastOrderAt time.Time
 }
@@ -117,7 +129,7 @@ func New(c cfg.Sentinel) *Sentinel {
 		now:     time.Now,
 		windows: make(map[string]*PriceWindow),
 		states:  make(map[string]*symbolState),
-		vols:    make(map[string]volEntry),
+		stats:   make(map[string]statsEntry),
 	}
 }
 
@@ -149,7 +161,8 @@ func (s *Sentinel) state(key string) *symbolState {
 
 // Warmup 做两件启动期的事, 都是为了让进程一上来就能正确判定:
 //
-//  1. 用 1 小时 K 线算出各空单品种的波动率, 决定反弹阈值 B;
+//  1. 用 1 小时 K 线算出各空单品种的波动率与回撤分位数, 决定反弹阈值 B 与
+//     武装阈值 A;
 //  2. 用 1 分钟 K 线回补价格窗口, 并重放状态机, 使进程在暴跌中途重启时
 //     已经跟踪到的最低点不会丢失。
 //
@@ -176,16 +189,24 @@ func (s *Sentinel) Warmup(ctx context.Context) (WarmupResult, error) {
 		}
 
 		sleepCtx(ctx, warmupPace)
-		vol, err := s.fetchVol(ctx, h, now)
+		st, err := s.fetchStats(ctx, h, now)
 		switch {
 		case err != nil:
 			res.VolFallback++
-			log.Printf("计算 %s 波动率失败, 暂用兜底阈值 %g%%: %v", h.pos.Symbol, s.cfg.ReboundFallbackPct, err)
-		case vol <= 0:
-			res.VolFallback++
+			res.ArmFallback++
+			log.Printf("计算 %s 的波动率/回撤分位数失败, A、B 暂用兜底值: %v", h.pos.Symbol, err)
 		default:
-			s.vols[h.key()] = volEntry{vol: vol, at: now}
-			res.VolOK++
+			s.stats[h.key()] = statsEntry{stats: st, at: now}
+			if st.vol > 0 {
+				res.VolOK++
+			} else {
+				res.VolFallback++
+			}
+			if st.arm > 0 {
+				res.ArmOK++
+			} else {
+				res.ArmFallback++
+			}
 		}
 
 		sleepCtx(ctx, warmupPace)
@@ -196,7 +217,7 @@ func (s *Sentinel) Warmup(ctx context.Context) (WarmupResult, error) {
 			continue
 		}
 		s.replay(s.state(h.key()), s.window(h.key()), cs, now,
-			profitPct(h.pos), s.cfg.DropPctFor(h.pos.Symbol), s.reboundFor(h))
+			profitPct(h.pos), s.armFor(h), s.reboundFor(h))
 		res.WindowOK++
 
 		if i > 0 && i%warmupLogEvery == 0 {
@@ -238,9 +259,9 @@ func (s *Sentinel) replay(st *symbolState, w *PriceWindow, candles []bybit.Candl
 	}
 }
 
-// ensureVol 为缺失或过期的品种补算波动率。每轮最多补 volFetchPerCycle 个,
-// 把请求摊到多轮, 也顺带覆盖了运行中新开的仓位。
-func (s *Sentinel) ensureVol(ctx context.Context, held []held, now time.Time) {
+// ensureStats 为缺失或过期的品种补算 A、B 所需的统计量。每轮最多补
+// volFetchPerCycle 个, 把请求摊到多轮, 也顺带覆盖了运行中新开的仓位。
+func (s *Sentinel) ensureStats(ctx context.Context, held []held, now time.Time) {
 	budget := volFetchPerCycle
 	for _, h := range held {
 		if budget <= 0 || ctx.Err() != nil {
@@ -249,41 +270,104 @@ func (s *Sentinel) ensureVol(ctx context.Context, held []held, now time.Time) {
 		if !isShort(h.pos) {
 			continue
 		}
-		if e, ok := s.vols[h.key()]; ok && now.Sub(e.at) < volMaxAge {
+		if e, ok := s.stats[h.key()]; ok && now.Sub(e.at) < volMaxAge {
 			continue
 		}
 		budget--
 
-		vol, err := s.fetchVol(ctx, h, now)
+		st, err := s.fetchStats(ctx, h, now)
 		if err != nil {
-			log.Printf("计算 %s 波动率失败, 暂用兜底阈值 %g%%: %v", h.pos.Symbol, s.cfg.ReboundFallbackPct, err)
+			log.Printf("计算 %s 的波动率/回撤分位数失败, A、B 暂用兜底值: %v", h.pos.Symbol, err)
 			continue
 		}
-		s.vols[h.key()] = volEntry{vol: vol, at: now}
+		s.stats[h.key()] = statsEntry{stats: st, at: now}
 	}
 }
 
-// fetchVol 拉 1 小时 K 线并算出单根收益率的标准差。K 线不足时返回 0 而不是错误。
-func (s *Sentinel) fetchVol(ctx context.Context, h held, now time.Time) (float64, error) {
-	limit := int(s.cfg.VolLookback/volStep) + 2
+// armWindowBars 是回撤分位数统计所用的窗口长度(以小时 K 线根数计), 与运行时判定
+// 用的 DropWindow 对齐。窗口不足一根 K 线时按一根算。
+func (s *Sentinel) armWindowBars() int {
+	n := int(s.cfg.DropWindow / volStep)
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// fetchStats 拉一次 1 小时 K 线, 同时算出决定 A 和 B 的两个数。两个数来自同一批
+// K 线, 所以只发一次请求; 回看长度取两者中更长的那个。
+//
+// 任一数样本不足时返回 0 而不是错误——绝不能因为一个品种上市太新, 就让它永远
+// 不平仓。调用方据此退回兜底值。
+func (s *Sentinel) fetchStats(ctx context.Context, h held, now time.Time) (stats, error) {
+	var st stats
+
+	lookback := s.cfg.VolLookback
+	if armLookback > lookback {
+		lookback = armLookback
+	}
+	limit := int(lookback/volStep) + s.armWindowBars() + 2
 	if limit > bybit.MaxKlineLimit {
 		limit = bybit.MaxKlineLimit
 	}
-	cs, err := s.bc.Candles(ctx, h.category, h.pos.Symbol, volInterval, now.Add(-s.cfg.VolLookback), now, limit)
+
+	cs, err := s.bc.Candles(ctx, h.category, h.pos.Symbol, volInterval, now.Add(-lookback), now, limit)
 	if err != nil {
-		return 0, err
+		return st, err
 	}
-	vol, n := HourlyVol(barSeries(cs, volStep, now), volStep)
-	if n < volMinBars {
-		log.Printf("%s 可用的 1 小时 K 线只有 %d 根(至少需要 %d 根), 波动率无法估计",
-			h.pos.Symbol, n, volMinBars)
+	bars := barSeries(cs, volStep, now)
+
+	// σ 只用最近 VolLookback 那一小段: B 要跟着行情动, 暴跌当天就该变宽
+	if v, n := HourlyVol(recent(bars, s.cfg.VolLookback, now), volStep); n < volMinBars {
+		log.Printf("%s 可用的 1 小时 K 线只有 %d 根(至少需要 %d 根), 波动率无法估计, B 用兜底值 %g%%",
+			h.pos.Symbol, n, volMinBars, s.cfg.ReboundFallbackPct)
+	} else {
+		st.vol = v
 	}
-	return vol, nil
+
+	// 分位数用整段回看: A 要稳, 不能被当前这场暴跌自己抬高
+	if s.cfg.ArmQuantile > 0 {
+		if a, n := DropQuantile(bars, s.armWindowBars(), s.cfg.ArmQuantile); n < dropMinBars {
+			log.Printf("%s 只有 %d 根 1 小时 K 线(至少需要 %d 根), 回撤分位数无法估计, A 用固定值 %g%%",
+				h.pos.Symbol, n, dropMinBars, s.cfg.DropPct)
+		} else {
+			st.arm = a
+		}
+	}
+	return st, nil
+}
+
+// recent 截取 now-lookback 之后走完的那些 K 线。
+func recent(bars []bar, lookback time.Duration, now time.Time) []bar {
+	cutoff := now.Add(-lookback)
+	i := 0
+	for i < len(bars) && bars[i].t.Before(cutoff) {
+		i++
+	}
+	return bars[i:]
+}
+
+// armFor 返回品种适用的武装阈值 A。分位数拿不到时由 cfg 退回固定值。
+func (s *Sentinel) armFor(h held) float64 {
+	return s.cfg.ArmPctFor(h.pos.Symbol, s.stats[h.key()].arm)
 }
 
 // reboundFor 返回品种适用的反弹阈值 B。波动率拿不到时由 cfg 退回兜底值。
 func (s *Sentinel) reboundFor(h held) float64 {
-	return s.cfg.ReboundFor(h.pos.Symbol, s.vols[h.key()].vol)
+	return s.cfg.ReboundFor(h.pos.Symbol, s.stats[h.key()].vol)
+}
+
+// ArmLabel 概括 A 的来源, 用于启动日志与通知抬头。
+func (s *Sentinel) ArmLabel() string {
+	label := fmt.Sprintf("回撤分位数自适应(%.1f%% 分位, 回看 %d 天, 兜底 %.2f%%)",
+		s.cfg.ArmQuantile*100, int(armLookback.Hours()/24), s.cfg.DropPct)
+	if s.cfg.ArmQuantile <= 0 {
+		label = fmt.Sprintf("固定 %.2f%%", s.cfg.DropPct)
+	}
+	if n := len(s.cfg.Overrides); n > 0 {
+		label = fmt.Sprintf("%s + %d 个品种固定值", label, n)
+	}
+	return label
 }
 
 // ReboundLabel 概括 B 的来源, 用于启动日志与通知抬头。
@@ -320,8 +404,8 @@ func (s *Sentinel) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// 波动率要在判定之前补齐, 否则新仓位或过期的缓存会让 B 退回兜底值
-	s.ensureVol(ctx, held, now)
+	// 统计量要在判定之前补齐, 否则新仓位或过期的缓存会让 A、B 退回兜底值
+	s.ensureStats(ctx, held, now)
 
 	seen := make(map[string]bool, len(held))
 	var cands []candidate
@@ -355,7 +439,7 @@ func (s *Sentinel) RunOnce(ctx context.Context) error {
 
 		st := s.state(key)
 		profit := profitPct(h.pos)
-		armPct := s.cfg.DropPctFor(h.pos.Symbol)
+		armPct := s.armFor(h)
 		reboundPct := s.reboundFor(h)
 
 		trigger := st.step(now, price, fall, profit, armPct, reboundPct, s.cfg.MinProfitPct)
@@ -544,9 +628,9 @@ func (s *Sentinel) prune(seen map[string]bool) {
 			delete(s.states, k)
 		}
 	}
-	for k := range s.vols {
+	for k := range s.stats {
 		if !seen[k] {
-			delete(s.vols, k)
+			delete(s.stats, k)
 		}
 	}
 }
@@ -567,8 +651,8 @@ func (s *Sentinel) buildMessage(now time.Time, triggered int, lines []string) st
 		b.WriteString("✅ 回撤止盈执行结果\n")
 	}
 	fmt.Fprintf(&b, "时间(UTC): %s\n", now.UTC().Format("2006-01-02 15:04:05"))
-	fmt.Fprintf(&b, "窗口 %s | 默认 A=%.2f%% | B=%s | 浮盈门槛 %.2f%%\n\n",
-		s.cfg.DropWindow, s.cfg.DropPct, s.ReboundLabel(), s.cfg.MinProfitPct)
+	fmt.Fprintf(&b, "窗口 %s | A=%s | B=%s | 浮盈门槛 %.2f%%\n\n",
+		s.cfg.DropWindow, s.ArmLabel(), s.ReboundLabel(), s.cfg.MinProfitPct)
 
 	shown := lines
 	if len(shown) > maxListed {

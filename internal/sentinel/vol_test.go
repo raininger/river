@@ -19,9 +19,34 @@ func buildBars(n int, step time.Duration, f func(i int) float64) []bar {
 }
 
 func candleAt(open time.Time, close string) bybit.Candle {
+	return candleOHLC(open, close, close)
+}
+
+func candleOHLC(open time.Time, high, close string) bybit.Candle {
 	return bybit.Candle{
 		OpenTime: strconv.FormatInt(open.UnixMilli(), 10),
+		High:     high,
 		Close:    close,
+	}
+}
+
+// 分位数必须由「最高价」算出, 而不是只看收盘价。用收盘价的话, 一根 K 线内
+// 冲高又回落这段完全看不见, 而那正是暴跌最典型的形态。
+func TestBarSeriesCarriesHigh(t *testing.T) {
+	now := t0.Add(2 * time.Hour)
+	cs := []bybit.Candle{candleOHLC(t0, "108", "101")}
+
+	bars := barSeries(cs, time.Hour, now)
+	if len(bars) != 1 {
+		t.Fatalf("应有 1 根走完的 K 线, 实际 %d", len(bars))
+	}
+	if bars[0].high != 108 {
+		t.Fatalf("最高价应为 108, 实际 %v", bars[0].high)
+	}
+	// 最高价缺失时退回收盘价, 不能让回撤算成负数
+	bars = barSeries([]bybit.Candle{candleAt(t0, "101")}, time.Hour, now)
+	if bars[0].high != 101 {
+		t.Fatalf("最高价缺失时应退回收盘价 101, 实际 %v", bars[0].high)
 	}
 }
 
@@ -89,6 +114,79 @@ func TestBarSeriesSortsAndDropsIncompleteBar(t *testing.T) {
 	}
 	if want := t0.Add(2 * time.Hour); !bars[1].t.Equal(want) || bars[1].close != 102 {
 		t.Fatalf("第 1 根应为 %v/102, 实际 %v/%v", want, bars[1].t, bars[1].close)
+	}
+}
+
+// flatBars 造 n 根最高价与收盘价相同的 K 线, 即自身不含任何回落。
+func flatBars(n int, price float64) []bar {
+	bars := make([]bar, n)
+	for i := range bars {
+		bars[i] = bar{t: t0.Add(time.Duration(i) * time.Hour), high: price, close: price}
+	}
+	return bars
+}
+
+func barAt(i int, high, close float64) bar {
+	return bar{t: t0.Add(time.Duration(i) * time.Hour), high: high, close: close}
+}
+
+// 分位数要落在「暴跌那一档」上, 而不是被大量的平静样本稀释掉。
+func TestDropQuantilePicksTailNotMedian(t *testing.T) {
+	bars := flatBars(380, 100)
+	for i := 380; i < 400; i++ {
+		bars = append(bars, barAt(i, 100, 85)) // 从 100 回落到 85, 即 15%
+	}
+
+	got, n := DropQuantile(bars, 1, 0.995)
+	if n != 400 {
+		t.Fatalf("应有 400 个样本, 实际 %d", n)
+	}
+	approx(t, got, 15)
+
+	// 中位数取到的仍是「平时的回撤」0, 说明分位数确实在挑尾部而不是随便给个数
+	if got, _ := DropQuantile(bars, 1, 0.5); got != 0 {
+		t.Fatalf("中位数应为 0, 实际 %v", got)
+	}
+}
+
+// 窗口要跨越多根 K 线: 最高价在前一根、当根只是回落, 只窗口取 1 根是看不出来的。
+// 这正是「从最近 N 小时的高点跌下来」与「单根 K 线自身回落」的区别。
+func TestDropQuantileWindowSpansBars(t *testing.T) {
+	bars := flatBars(400, 100)
+	bars[0] = barAt(0, 200, 200) // 前一根冲到 200 又收在 200, 自身没有回落
+	bars[1] = barAt(1, 200, 200)
+
+	// 窗口 3 根时才能看见「200 → 100」这 50% 的落差
+	got, n := DropQuantile(bars, 3, 0.995)
+	if n < dropMinBars {
+		t.Fatalf("样本数应足够, 实际 %d", n)
+	}
+	approx(t, got, 50)
+
+	// 只取当根的话, 每一根自身都没有回落, 分位数就是 0
+	if got, n := DropQuantile(bars, 1, 0.995); n < dropMinBars || got != 0 {
+		t.Fatalf("窗口只有 1 根时不应看到落差, 实际 got=%v n=%d", got, n)
+	}
+}
+
+// 样本不足时返回 0, 调用方据此退回固定阈值; 同时如实报告样本数用于日志。
+func TestDropQuantileTooFewBars(t *testing.T) {
+	got, n := DropQuantile(flatBars(150, 100), 1, 0.995)
+	if got != 0 {
+		t.Fatalf("样本不足时应返回 0, 实际 %v", got)
+	}
+	if n != 150 {
+		t.Fatalf("应如实报告 150 个样本, 实际 %d", n)
+	}
+}
+
+// 非法分位数直接判为不可用, 免得算出一个没有意义的阈值。
+func TestDropQuantileRejectsBadQuantile(t *testing.T) {
+	bars := flatBars(400, 100)
+	for _, q := range []float64{0, -0.1, 1, 1.5} {
+		if got, n := DropQuantile(bars, 1, q); got != 0 || n != 0 {
+			t.Fatalf("q=%v 应判为不可用, 实际 got=%v n=%d", q, got, n)
+		}
 	}
 }
 
